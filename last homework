@@ -1,0 +1,301 @@
+function safeFetchWithRetry(url, options, maxRetries = 3, retryDelayMs = 5000) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      const json = JSON.parse(response.getContentText());
+
+      if (!json.error || json.error !== 'ratelimited') {
+        return json; 
+      }
+
+      Logger.log(`⏳ Rate limit hit. Retrying ${attempt + 1}/${maxRetries} after ${retryDelayMs / 1000}s...`);
+      Utilities.sleep(retryDelayMs);
+    } catch (e) {
+      Logger.log(`⚠️ Fetch エラー (試行 ${attempt + 1}): ${e}`);
+      Utilities.sleep(retryDelayMs);
+    }
+  }
+
+  Logger.log(`❌ Rate limit exceeded after ${maxRetries} retries: ${url}`);
+  return { ok: false, error: 'ratelimited' };
+}
+
+function setSlackToken() {
+  const token = 'ここにslacktokenを入力'; 
+  PropertiesService.getScriptProperties().setProperty('SLACK_TOKEN', token);
+  Logger.log('Slackトークンが設定されました。');
+}
+
+function setOpenAIApiKey() {
+  const key = 'ここにOpenAIkeyを入力';
+  PropertiesService.getScriptProperties().setProperty('OPENAI_API_KEY', key);
+  Logger.log('OpenAI APIキーが設定されました。');
+}
+
+function myFunction() {
+  const channelIds = ['ここにslackチャンネルIDを入力'];
+  for (const channelId of channelIds) {
+    fetchSlackMessages(channelId);
+  }
+}
+
+function fetchSlackMessages(channelId, cursor) {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('SLACK_TOKEN');
+  let latestTs = parseFloat(props.getProperty(`LATEST_TIMESTAMP_${channelId}`)) || 0;
+
+  if (!token) {
+    Logger.log('Slackトークンが見つかりません。setSlackToken()を先に実行してください。');
+    return;
+  }
+
+  let url = `https://slack.com/api/conversations.history?channel=${channelId}&limit=100`;
+  if (cursor) url += `&cursor=${encodeURIComponent(cursor)}`;
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    muteHttpExceptions: true,
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  const json = JSON.parse(response.getContentText());
+  if (!json.ok) {
+    Logger.log(`Slack API エラー (${channelId}): ${json.error}`);
+    return;
+  }
+
+  const messages = json.messages || [];
+  let newestTs = latestTs;
+  const messagesToSave = [];
+
+  messages.forEach(msg => {
+    const ts = parseFloat(msg.ts);
+    if (ts <= latestTs || !msg.text) return;
+    if (!msg.user) return;
+
+    const userName = getSlackUserName(token, msg.user);
+    const threadReplies = msg.thread_ts ? fetchReplies(token, channelId, msg.thread_ts) : [];
+
+    messagesToSave.push({
+      user: userName,
+      text: msg.text,
+      ts: msg.ts,
+      replies: threadReplies
+    });
+
+    if (ts > newestTs) newestTs = ts;
+  });
+
+  if (messagesToSave.length > 0) {
+    saveMessagesToGoogleDoc(channelId, messagesToSave);
+  }
+
+  props.setProperty(`LATEST_TIMESTAMP_${channelId}`, newestTs.toString());
+
+  if (json.has_more && json.response_metadata?.next_cursor) {
+    props.setProperty(`SLACK_CURSOR_${channelId}`, json.response_metadata.next_cursor);
+    props.setProperty('FETCH_CHANNEL', channelId);
+    createContinueFetchTrigger();
+  } else {
+    props.deleteProperty(`SLACK_CURSOR_${channelId}`);
+    props.deleteProperty('FETCH_CHANNEL');
+    deleteContinueFetchTriggers();
+  }
+}
+
+function fetchReplies(token, channelId, threadTs) {
+  Utilities.sleep(1000);
+  const url = `https://slack.com/api/conversations.replies?channel=${channelId}&ts=${threadTs}`;
+  const options = {
+    method: 'get',
+    headers: { Authorization: `Bearer ${token}` },
+    muteHttpExceptions: true
+  };
+
+  const json = safeFetchWithRetry(url, options);
+  if (!json.ok) return [];
+
+  return (json.messages || []).slice(1).map(reply => ({
+    user: getSlackUserName(token, reply.user),
+    text: reply.text
+  }));
+}
+
+const userCache = {};
+
+function getSlackUserName(token, userId) {
+  if (!userId || !token) {
+    Logger.log(`⚠️ getSlackUserName: userIdまたはtokenが未定義（userId: ${userId}, token: ${token}）`);
+    return '(不明なユーザー)';
+  }
+
+  if (userCache[userId]) return userCache[userId];
+
+  try {
+    Utilities.sleep(1000);
+    const url = `https://slack.com/api/users.info?user=${userId}`;
+    const options = {
+      method: 'get',
+      headers: { Authorization: `Bearer ${token}` },
+      muteHttpExceptions: true
+    };
+
+    const json = safeFetchWithRetry(url, options);
+    const name = json.ok ? (json.user.real_name || json.user.name) : '(取得失敗)';
+    userCache[userId] = name;
+    return name;
+  } catch (e) {
+    Logger.log(`ユーザー名取得エラー: ${e}`);
+    return '(取得エラー)';
+  }
+}
+
+function saveMessagesToGoogleDoc(channelId, messages) {
+  const doc = DocumentApp.create(`Slack評価_${channelId}_${new Date().toISOString()}`);
+  const body = doc.getBody();
+  const goodSpeakers = new Set();
+  const scoreMap = {};
+
+  messages.forEach((msg, i) => {
+    const score = callOpenAIAssessment(msg.text);
+    body.appendParagraph(`【メッセージ ${i + 1}】`);
+    body.appendParagraph(`投稿者: ${msg.user}`);
+    body.appendParagraph(`スコア: ${score}/10`);
+    body.appendParagraph(msg.text);
+
+    if (!scoreMap[msg.user]) scoreMap[msg.user] = { total: 0, count: 0 };
+    scoreMap[msg.user].total += score;
+    scoreMap[msg.user].count += 1;
+
+    if (score >= 7) {
+      goodSpeakers.add(msg.user);
+    }
+
+    if (msg.replies.length > 0) {
+      body.appendParagraph('　↳ 返信:');
+      msg.replies.forEach(reply => {
+        const rScore = callOpenAIAssessment(reply.text);
+        body.appendParagraph(`　・${reply.user}（スコア: ${rScore}/10）: ${reply.text}`);
+
+        if (!scoreMap[reply.user]) scoreMap[reply.user] = { total: 0, count: 0 };
+        scoreMap[reply.user].total += rScore;
+        scoreMap[reply.user].count += 1;
+
+        if (rScore >= 7) {
+          goodSpeakers.add(reply.user);
+        }
+      });
+    }
+
+    body.appendParagraph('');
+  });
+
+  if (goodSpeakers.size > 0) {
+    body.appendParagraph('======');
+    body.appendParagraph('🌟 良い発言者一覧 🌟');
+    Array.from(goodSpeakers).forEach(name => body.appendParagraph(`・${name}`));
+  }
+
+  const ranking = Object.entries(scoreMap)
+    .map(([user, { total, count }]) => ({ user, avg: total / count, total, count }))
+    .filter(u => u.count >= 2)
+    .sort((a, b) => b.avg - a.avg);
+
+  if (ranking.length > 0) {
+    body.appendParagraph('======');
+    body.appendParagraph('🏆 平均スコアランキング（上位）🏆');
+    ranking.forEach((entry, index) => {
+      body.appendParagraph(`${index + 1}. ${entry.user} - 平均スコア: ${entry.avg.toFixed(2)} (${entry.count}件)`);
+    });
+  }
+
+  doc.saveAndClose();
+  Logger.log(`AI評価付きドキュメント作成（${channelId}）: ${doc.getUrl()}`);
+}
+
+function callOpenAIAssessment(text) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('OPENAI_API_KEY');
+  if (!apiKey) {
+    Logger.log('OpenAI APIキーが設定されていません。');
+    return 0;
+  }
+
+  const prompt = `
+以下のSlackの投稿が「他の人の学びや理解にどれだけ貢献するか」を10点満点で評価してください。
+数値のみ（1〜10の整数）を返してください。他の文章は一切不要です。
+
+投稿内容: "${text}"
+`;
+
+  const payload = {
+    model: "gpt-4.1",
+    messages: [
+      { role: "system", content: "あなたはSlack投稿を教育的価値の観点から評価するAIです。" },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.2
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', options);
+    const json = JSON.parse(response.getContentText());
+    const textResponse = json.choices?.[0]?.message?.content?.trim();
+
+    if (!textResponse) {
+      Logger.log(`OpenAI 応答が不正です: ${JSON.stringify(json)}`);
+      return 0;
+    }
+
+    const match = textResponse.match(/\b(10|[1-9])\b/);
+    return match ? parseInt(match[1], 10) : 0;
+  } catch (e) {
+    Logger.log(`OpenAI APIエラー: ${e}`);
+    return 0;
+  }
+}
+
+function createContinueFetchTrigger() {
+  const allTriggers = ScriptApp.getProjectTriggers();
+  allTriggers.forEach(trigger => {
+    if (trigger.getHandlerFunction() === 'continueFetch') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+  ScriptApp.newTrigger('continueFetch').timeBased().after(30 * 1000).create();
+}
+
+function deleteContinueFetchTriggers() {
+  const allTriggers = ScriptApp.getProjectTriggers();
+  allTriggers.forEach(trigger => {
+    if (trigger.getHandlerFunction() === 'continueFetch') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+function deleteAllTriggers() {
+  const allTriggers = ScriptApp.getProjectTriggers();
+  allTriggers.forEach(trigger => {
+    ScriptApp.deleteTrigger(trigger);
+  });
+}
+function createDailyTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let t of triggers) {
+    if (t.getHandlerFunction() === 'myFunction') {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+  ScriptApp.newTrigger('myFunction')
+    .timeBased()
+    .everyDays(1)
+    .atHour(0) 
+    .create();
+}
